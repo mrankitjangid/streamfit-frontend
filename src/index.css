@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.btn-control {
+    @apply px-4 py-2 rounded-md text-lg font-semibold flex items-center gap-2 transition;
+}
+
+.media-card {
+    @apply p-4 bg-gray-800 bg-opacity-50 backdrop-blur-lg shadow-lg rounded-lg flex flex-col items-center;
+}
+
