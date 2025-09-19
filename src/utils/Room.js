@@ -1,5 +1,5 @@
 class RoomClient {
-    constructor(_room_id, _name, _socket, _mediasoupClient) {
+    constructor(_room_id, _name, _socket, _mediasoupClient, callbacks = {}) {
         this.room_id = _room_id;
         this.name = _name;
         this.socket = _socket;
@@ -13,6 +13,12 @@ class RoomClient {
         this.consumers = new Map();
 
         this.producerLabel = new Map();
+
+        // Callbacks for stream management
+        this.onLocalStreamAdd = callbacks.onLocalStreamAdd || function() {};
+        this.onLocalStreamRemove = callbacks.onLocalStreamRemove || function() {};
+        this.onRemoteStreamAdd = callbacks.onRemoteStreamAdd || function() {};
+        this.onRemoteStreamRemove = callbacks.onRemoteStreamRemove || function() {};
     }
 
     async joinRoom() {
@@ -253,9 +259,6 @@ class RoomClient {
     async produce(type) {
         try {
             let options = {}, stream;
-            const vp9Codec = this.device?.rtpCapabilities?.codecs?.find(
-                c => c.mimeType.toLowerCase() === 'video/vp9'
-            );
             switch(type) {
                 case 'video':
                     stream = await navigator.mediaDevices.getUserMedia({
@@ -266,23 +269,11 @@ class RoomClient {
                         // video: true
                     });
                     options.track = stream.getVideoTracks()[0];
-                    if (vp9Codec) {
-                        options.codec = vp9Codec;
-                        options.encodings = [
-                            {
-                                maxBitrate: 5_000_000
-                            }
-                        ];
-                        options.codecOptions = {
-                            videoGoogleStartBitrate: 1000
-                        };
-                    } else {
-                        options.encodings = [
-                            { maxBitrate: 500_000, scaleResolutionDownBy: 4 },
-                            { maxBitrate: 1_000_000, scaleResolutionDownBy: 2 },
-                            { maxBitrate: 2_000_000, scaleResolutionDownBy: 1 }
-                        ];
-                    }
+                    options.encodings = [
+                        { maxBitrate: 500_000, scaleResolutionDownBy: 4 },
+                        { maxBitrate: 1_000_000, scaleResolutionDownBy: 2 },
+                        { maxBitrate: 2_000_000, scaleResolutionDownBy: 1 }
+                    ];
                     break;
                 case 'audio':
                     stream = await navigator.mediaDevices.getUserMedia({
@@ -293,42 +284,37 @@ class RoomClient {
                 case 'screen':
                     stream = await navigator.mediaDevices.getDisplayMedia();
                     options.track = stream.getVideoTracks()[0];
-                    options.codec = this.device?.rtpCapabilities?.codecs?.find(c => c.mimeType.toLowerCase() === 'video/vp9');
-                    options.codecOptions = {
-                        videoGoogleStartBitrate: 1000
-                    }
+                    options.encodings = [
+                        { maxBitrate: 500_000, scaleResolutionDownBy: 4 },
+                        { maxBitrate: 1_000_000, scaleResolutionDownBy: 2 },
+                        { maxBitrate: 2_000_000, scaleResolutionDownBy: 1 }
+                    ];
                     break;
                 default:
                     return;
             }
-    
+
             const producer = await this.producerTransport.produce(options);
-    
+
             this.producers.set(producer.id, producer);
             this.producerLabel.set(type, producer.id);
-    
-            const parent = document.getElementById('localMedia');
-            let elem = this.createElement(type, stream, producer.id, parent);
-    
+
+            // Call callback to add local stream instead of direct DOM manipulation
+            this.onLocalStreamAdd(type, stream, producer.id);
+
             producer.on('trackended', () => {
                 this.closeProducer(type);
             });
 
             producer.on('transportclose', () => {
                 console.log('Producer tranport closed');
-                if( type !== 'audio' ) {
-                    elem.srcObject.getTracks().forEach(track => track.stop());
-                    elem.parentNode.removeChild(elem);
-                }
+                this.onLocalStreamRemove(type, producer.id);
                 this.producers.delete(producer.id);
             });
 
             producer.on('close', () => {
                 console.log('Closing producer');
-                if( type !== 'audio' ) {
-                    elem.srcObject.getTracks().forEach(track => track.stop());
-                    elem.parentNode.removeChild(elem);
-                }
+                this.onLocalStreamRemove(type, producer.id);
                 this.producers.delete(producer.id);
             });
         } catch( err ) {
@@ -342,8 +328,8 @@ class RoomClient {
 
         this.consumers.set(producer_id, consumer);
 
-        const parent = document.getElementById('remoteMedia');
-        this.createElement(kind, stream, producer_id, parent);
+        // Call callback to add remote stream instead of direct DOM manipulation
+        this.onRemoteStreamAdd(kind, stream, producer_id);
 
         consumer.on(
             'trackended',
@@ -369,11 +355,17 @@ class RoomClient {
 
     async getConsumeStream(producerId) {
         const { rtpCapabilities } = this.device;
+        console.log('Client rtpCapabilities:', rtpCapabilities);
         const data = await this.socket.request('consume', {
             rtpCapabilities,
             consumerTransportId: this.consumerTransport.id,
             producerId
         });
+        if (!data) {
+            console.error('Consume request failed or returned no data');
+            throw new Error('Consume request failed or returned no data');
+        }
+        console.log('Consume response data:', data);
         const { id, kind, rtpParameters } = data;
 
         let codecOptions = {};
@@ -395,37 +387,43 @@ class RoomClient {
         }
     }
 
-    // removeConsumer(consumer_id) {
-    //     const elem = document.getElementById(consumer_id);
-    //     console.log('removing consumer', consumer_id);
-    //     elem.srcObject.getTracks().forEach(track => track.stop());
-    //     elem.parentNode.removeChild(elem);
-    //     this.consumers.get(consumer_id).close();
-    //     this.consumers.delete(consumer_id);
-    // }
+    removeConsumer(producer_id) {
+        // Call callback to remove remote stream instead of direct DOM manipulation
+        this.onRemoteStreamRemove(producer_id);
 
-    // closeProducer(type) {
-    //     if( !this.producerLabel.has(type) ) {
-    //         console.log('No producer for type:', type);
-    //         return;
-    //     }
+        // Close and delete the consumer
+        const consumer = this.consumers.get(producer_id);
+        if (consumer) {
+            consumer.close();
+            this.consumers.delete(producer_id);
+        }
+    }
 
-    //     const producer_id = this.producerLabel.get(type);
+    closeProducer(type) {
+        // Check if producer exists
+        if (!this.producerLabel.has(type)) {
+            console.log('No producer for type:', type);
+            return;
+        }
 
-    //     this.socket.emit('producerClosed', {
-    //         producer_id
-    //     });
+        // Get producer ID
+        const producer_id = this.producerLabel.get(type);
 
-    //     this.producers.get(producer_id).close();
-    //     this.producers.delete(producer_id);
-    //     this.producerLabel.delete(type);
+        // Notify server
+        this.socket.emit('producerClosed', {
+            producer_id
+        });
 
-    //     if( type !== 'audio' ) {
-    //         const elem = document.getElementById(producer_id);
-    //         elem.srcObject.getTracks().forEach(track => track.stop());
-    //         elem.parentNode.removeChild(elem);
-    //     }
-    // }
+        // Close and clean up producer
+        const producer = this.producers.get(producer_id);
+        if (producer) {
+            producer.close();
+            this.producers.delete(producer_id);
+        }
+
+        // Remove from producer label map
+        this.producerLabel.delete(type);
+    }
 
     // createElement(kind, stream, _id, _parent = null) {
     //     let elem;
