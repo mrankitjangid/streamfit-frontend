@@ -1,778 +1,278 @@
+import DeviceManager from './room/DeviceManager';
+import TransportManager from './room/TransportManager';
+import ProducerManager from './room/ProducerManager';
+import ConsumerManager from './room/ConsumerManager';
+import MediaElementManager from './room/MediaElementManager';
+import SocketEventHandler from './room/SocketEventHandler';
+
 class RoomClient {
-    constructor(_room_id, _name, _socket, _mediasoupClient, callbacks = {}) {
+    constructor(_room_id, _name, _socket, _mediasoupClient) {
         this.room_id = _room_id;
         this.name = _name;
         this.socket = _socket;
         this.mediasoupClient = _mediasoupClient;
 
+        // Initialize managers
+        this.deviceManager = new DeviceManager(this.mediasoupClient);
         this.device = null;
-        this.producerTransport = null;
-        this.consumerTransport = null;
-        
-        this.producers = new Map();
-        this.consumers = new Map();
-
-        this.producerLabel = new Map();
-
-        // Callbacks for stream management
-        this.onLocalStreamAdd = callbacks.onLocalStreamAdd || function() {};
-        this.onLocalStreamRemove = callbacks.onLocalStreamRemove || function() {};
-        this.onRemoteStreamAdd = callbacks.onRemoteStreamAdd || function() {};
-        this.onRemoteStreamRemove = callbacks.onRemoteStreamRemove || function() {};
+        this.transportManager = null;
+        this.producerManager = null;
+        this.consumerManager = null;
+        this.mediaElementManager = new MediaElementManager();
+        this.socketEventHandler = null;
     }
 
     async joinRoom() {
-        this.socket.request(
-            'join-room',
-            {
-                room_id: this.room_id,
-                name: this.name
+        try {
+            console.log('Attempting to join room:', this.room_id);
+
+            const response = await this.socket.request(
+                'join-room',
+                {
+                    room_id: this.room_id,
+                    name: this.name
+                }
+            );
+
+            if (response.error) {
+                throw new Error(response.error.message || 'Failed to join room');
             }
-        )
-        .then(
-            async function(e) {
-                console.log('Joined room', e);
-                const routerRtpCapabilities = await this.socket.request('getRouterRtpCapabilities');
 
-                let device = await this.loadDevice(routerRtpCapabilities);
-                this.device = device;
+            console.log('Joined room successfully:', response);
 
-                this.initSockets();
-                await this.initTransports();
+            // Get router RTP capabilities
+            let routerRtpCapabilities;
+            try {
+                routerRtpCapabilities = await this.socket.request('getRouterRtpCapabilities');
+            } catch (error) {
+                console.error('Failed to get router capabilities:', error);
+                throw new Error('Failed to get router capabilities');
+            }
+
+            // Load device
+            try {
+                this.device = await this.deviceManager.loadDevice(routerRtpCapabilities);
+                console.log('Device loaded successfully:', this.device);
+            } catch (error) {
+                console.error('Failed to load MediaSoup device:', error);
+                throw new Error('Failed to load MediaSoup device');
+            }
+
+            // Initialize transports with the loaded device
+            this.transportManager = new TransportManager(this.device, this.socket);
+
+            try {
+                await this.transportManager.initTransports();
+                console.log('Transports initialized successfully');
+            } catch (error) {
+                console.error('Failed to initialize transports:', error);
+                throw new Error('Failed to initialize transports');
+            }
+
+            // Initialize other managers with updated transports and device
+            this.producerManager = new ProducerManager(this.transportManager.getProducerTransport(), this.device, this.socket);
+            this.consumerManager = new ConsumerManager(this.transportManager.getConsumerTransport(), this.device, this.socket);
+            this.socketEventHandler = new SocketEventHandler(this.socket, this.consumerManager, this.mediaElementManager);
+
+            // Initialize socket event handlers
+            this.socketEventHandler.initSockets();
+
+            // Get producers
+            try {
                 this.socket.emit('getProducers');
-            }.bind(this)
-        )
-        .catch(( err ) => {
-            console.error('join error:', err);
-        });
+            } catch (error) {
+                console.warn('Failed to get producers, continuing anyway:', error);
+            }
+
+            console.log('Room joined successfully');
+        } catch (err) {
+            console.error('Room join error:', err);
+            throw err;
+        }
     }
 
     exit(offline = false) {
         const clean = () => {
-            this.consumerTransport.close();
-            this.producerTransport.close();
-            this.socket.off('disconnect');
-            this.socket.off('newProducers');
-            this.socket.off('consumerClosed');
+            try {
+                // Close transports
+                this.transportManager.close();
+
+                // Clean up socket event listeners
+                if (this.socket) {
+                    this.socket.off('disconnect');
+                    this.socket.off('newProducers');
+                    this.socket.off('consumerClosed');
+                }
+            } catch (error) {
+                console.error('Error during cleanup:', error);
+            }
         }
 
-        if( !offline ) {
-            this.socket
-                .request('exit-room')
-                .then((e) => console.log(e))
-                .catch((e) => console.log(e))
-                .finally(() => clean());
+        if (!offline) {
+            // Check if socket is available before trying to exit
+            if (this.socket && this.socket.connected) {
+                this.socket
+                    .request('exit-room')
+                    .then((e) => console.log('Exited room:', e))
+                    .catch((e) => {
+                        console.error('Error exiting room:', e);
+                    })
+                    .finally(() => clean());
+            } else {
+                console.log('Socket not available, cleaning up locally');
+                clean();
+            }
         } else {
             clean();
         }
     }
 
-    async loadDevice(routerRtpCapabilities) {
-        let device;
-        try {
-            device = new this.mediasoupClient.Device();
-        } catch( err ) {
-            console.error('Error creating device:', err);
-        }
-        await device.load({
-            routerRtpCapabilities
-        });
-        return device;
-    }
-
-    async initTransports() {
-        // initialize producer transports
-        {
-            const data = await this.socket.request(
-                'createWebRtcTransport', {
-                    rtpCapabilities: this.device.rtpCapabilities
-                }
-            );
-            if( data?.error ) {
-                console.error(data.error);
-                return;
-            }
-
-            this.producerTransport = this.device.createSendTransport(data);
-
-            this.producerTransport.on(
-                'connect',
-                function({ dtlsParameters }, cb, eb) {
-                    this.socket.request(
-                        'connectTransport', {
-                            transport_id: data.id,
-                            dtlsParameters
-                        }
-                    )
-                    .then(cb)
-                    .catch(eb);
-                }.bind(this)
-            );
-
-            this.producerTransport.on(
-                'produce',
-                async function({ kind, rtpParameters }, cb, eb) {
-                    try {
-                        const { producer_id } = await this.socket.request(
-                            'produce', {
-                                transport_id: this.producerTransport.id,
-                                kind,
-                                rtpParameters
-                            }
-                        )
-                        cb({ id: producer_id });
-                    } catch( err ) {
-                        eb(err);
-                    }
-                }.bind(this)
-            );
-
-            this.producerTransport.on(
-                'connectionstatechange',
-                function( state ) {
-                    if( state === 'failed' ) {
-                        this.producerTransport.close();
-                    }
-                }.bind(this)
-            );
-        }
-
-        // initialize consumer transports
-        {
-            const data = await this.socket.request(
-                'createWebRtcTransport', {
-                    forceTcp: false
-                }
-            );
-            if( data?.error ) {
-                console.error(data.error);
-                return;
-            }
-
-            this.consumerTransport = this.device.createRecvTransport(data);
-
-            this.consumerTransport.on(
-                'connect',
-                function( {dtlsParameters}, cb, eb ) {
-                    this.socket.request(
-                        'connectTransport', {
-                            transport_id: this.consumerTransport.id,
-                            dtlsParameters
-                        }
-                    )
-                    .then(cb)
-                    .catch(eb);
-                }.bind(this)
-            );
-
-            this.consumerTransport.on(
-                'connectionstatechange',
-                function( state ) {
-                    if( state === 'failed' ) {
-                        this.consumerTransport.close();
-                    }
-                }.bind(this)
-            );
-        }
-    }
-
-    initSockets() {
-        this.socket.on(
-            'consumerClosed',
-            function ({ consumer_id }) {
-                console.log('Consumer closed:', consumer_id);
-                this.removeConsumer(consumer_id);
-            }.bind(this)
-        );
-
-        this.socket.on(
-            'newProducers',
-            async function(producerList) {
-                console.log('New producers:', producerList);
-                for( let { producer_id } of producerList ) {
-                    await this.consume(producer_id);
-                }
-            }.bind(this)
-        );
-
-        this.socket.on(
-            'disconnect',
-            () => this.exit(true)
-        );
-
-
-        this.socket.on(
-            'consumer-stats',
-            (data) => {
-                console.log(data);
-
-                const statsPanel = document.getElementById(`stats-${data.producer_id}`);
-                
-                statsPanel.innerHTML = `
-                    <h3 class="font-bold text-sm mb-2 text-gray-700 dark:text-gray-300">Network Stats</h3>
-                    <div class="space-y-1">
-                        <div class="flex justify-between">
-                            <span class="text-gray-600 dark:text-gray-400">Bandwidth:</span>
-                            <span class="font-medium">${data.current_conditions.bandwidth} Mbps</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-600 dark:text-gray-400">Throughput:</span>
-                            <span class="font-medium">${data.current_conditions.throughput}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-600 dark:text-gray-400">Latency:</span>
-                            <span class="font-medium">${data.current_conditions.latency} ms</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-600 dark:text-gray-400">Jitter:</span>
-                            <span class="font-medium">${data.current_conditions.jitter} ms</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-600 dark:text-gray-400">Congestion:</span>
-                            <span class="font-medium">${data.current_conditions.congestion_score}</span>
-                        </div>
-                        <div class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
-                            <h4 class="font-semibold text-xs mb-1 text-gray-700 dark:text-gray-300">Optimal Configuration</h4>
-                            <div class="flex justify-between">
-                                <span class="text-gray-600 dark:text-gray-400">Suggested Quality:</span>
-                                <span class="font-medium" id="quality-text-${data.producer_id}">${data.optimal_configuration.video_quality}</span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-600 dark:text-gray-400">Score:</span>
-                                <span class="font-medium">${data.current_conditions.current_score.toFixed(1)}</span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-600 dark:text-gray-400">Bandwidth:</span>
-                                <span class="font-medium">${data.optimal_configuration.bandwidth} Mbps</span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-600 dark:text-gray-400">Congestion Reduction:</span>
-                                <span class="font-medium">${data.optimal_configuration.congestion_reduction_percentage}</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }
-        );
-    }
-
     async produce(type) {
         try {
-            let options = {}, stream;
-            switch(type) {
-                case 'video':
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: {
-                            width: { ideal: 1920 },
-                            height: { ideal: 1080 }
-                        },
-                        // video: true
-                    });
-                    options.track = stream.getVideoTracks()[0];
-                    options.encodings = [
-                        { maxBitrate: 500_000, scaleResolutionDownBy: 4 },
-                        { maxBitrate: 1_000_000, scaleResolutionDownBy: 2 },
-                        { maxBitrate: 2_000_000, scaleResolutionDownBy: 1 }
-                    ];
-                    break;
-                case 'audio':
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        audio: true
-                    });
-                    options.track = stream.getAudioTracks()[0];
-                    break;
-                case 'screen':
-                    stream = await navigator.mediaDevices.getDisplayMedia();
-                    options.track = stream.getVideoTracks()[0];
-                    options.encodings = [
-                        { maxBitrate: 500_000, scaleResolutionDownBy: 4 },
-                        { maxBitrate: 1_000_000, scaleResolutionDownBy: 2 },
-                        { maxBitrate: 2_000_000, scaleResolutionDownBy: 1 }
-                    ];
-                    break;
-                default:
-                    return;
+            // Check if device is loaded
+            if (!this.deviceManager.getDevice()) {
+                console.error('Device not loaded:', {
+                    device: this.deviceManager.getDevice(),
+                    producerTransport: this.transportManager.getProducerTransport(),
+                    consumerTransport: this.transportManager.getConsumerTransport()
+                });
+                throw new Error('MediaSoup device not loaded. Please refresh and try again.');
             }
 
-            const producer = await this.producerTransport.produce(options);
+            // Check if producer transport is available
+            if (!this.transportManager.getProducerTransport()) {
+                console.error('Producer transport not initialized:', {
+                    device: this.deviceManager.getDevice(),
+                    producerTransport: this.transportManager.getProducerTransport(),
+                    consumerTransport: this.transportManager.getConsumerTransport()
+                });
+                throw new Error('Producer transport not initialized. Please refresh and try again.');
+            }
 
-            this.producers.set(producer.id, producer);
-            this.producerLabel.set(type, producer.id);
+            console.log('Creating producer with type:', type);
+            console.log('Producer transport state:', this.transportManager.getProducerTransport().connectionState);
 
-            // Call callback to add local stream instead of direct DOM manipulation
-            this.onLocalStreamAdd(type, stream, producer.id);
+            const { producer, stream } = await this.producerManager.produce(type);
+
+            const parent = document.getElementById('localMedia');
+            let elem = this.mediaElementManager.createElement(type, stream, producer.id, parent);
 
             producer.on('trackended', () => {
                 this.closeProducer(type);
             });
 
             producer.on('transportclose', () => {
-                console.log('Producer tranport closed');
-                this.onLocalStreamRemove(type, producer.id);
-                this.producers.delete(producer.id);
+                console.log('Producer transport closed');
+                if (type !== 'audio') {
+                    try {
+                        elem.srcObject.getTracks().forEach(track => track.stop());
+                        elem.parentNode.removeChild(elem);
+                    } catch (error) {
+                        console.error('Error cleaning up producer element:', error);
+                    }
+                }
+                this.producerManager.producers.delete(producer.id);
             });
 
             producer.on('close', () => {
                 console.log('Closing producer');
-                this.onLocalStreamRemove(type, producer.id);
-                this.producers.delete(producer.id);
+                if (type !== 'audio') {
+                    try {
+                        elem.srcObject.getTracks().forEach(track => track.stop());
+                        elem.parentNode.removeChild(elem);
+                    } catch (error) {
+                        console.error('Error cleaning up producer element:', error);
+                    }
+                }
+                this.producerManager.producers.delete(producer.id);
             });
-        } catch( err ) {
+
+            return { producer, stream, element: elem };
+        } catch (err) {
             console.error('Error producing:', err);
+            throw err;
         }
     }
 
     async consume(producer_id) {
-        if( !this.consumerTransport ) return;
-        const { consumer, stream, kind } = await this.getConsumeStream(producer_id);
-
-        this.consumers.set(producer_id, consumer);
-
-        // Call callback to add remote stream instead of direct DOM manipulation
-        this.onRemoteStreamAdd(kind, stream, producer_id);
-
-        consumer.on(
-            'trackended',
-            function() {
-                this.removeConsumer(producer_id);
-            }.bind(this)
-        );
-
-        consumer.on(
-            'transportclose',
-            function() {
-                this.removeConsumer(producer_id);
-            }.bind(this)
-        );
-
-        consumer.on(
-            'producerclose',
-            function() {
-                this.removeConsumer(producer_id);
-            }.bind(this)
-        );
-    }
-
-    async getConsumeStream(producerId) {
-        const { rtpCapabilities } = this.device;
-        console.log('Client rtpCapabilities:', rtpCapabilities);
-        const data = await this.socket.request('consume', {
-            rtpCapabilities,
-            consumerTransportId: this.consumerTransport.id,
-            producerId
-        });
-        if (!data) {
-            console.error('Consume request failed or returned no data');
-            throw new Error('Consume request failed or returned no data');
+        if (!this.transportManager.getConsumerTransport()) {
+            console.warn('No consumer transport available');
+            return;
         }
-        console.log('Consume response data:', data);
-        const { id, kind, rtpParameters } = data;
 
-        let codecOptions = {};
-        const consumer = await this.consumerTransport.consume({
-            id,
-            producerId,
-            kind,
-            rtpParameters,
-            codecOptions,
-        });
+        try {
+            const { consumer, stream, kind } = await this.consumerManager.consume(producer_id);
 
-        const stream = new MediaStream();
-        stream.addTrack(consumer.track);
+            const parent = document.getElementById('remoteMedia');
+            this.mediaElementManager.createElement(kind, stream, producer_id, parent);
 
-        return {
-            consumer,
-            stream,
-            kind
-        }
-    }
+            consumer.on(
+                'trackended',
+                function() {
+                    this.consumerManager.removeConsumer(producer_id);
+                    this.mediaElementManager.removeConsumer(producer_id);
+                }.bind(this)
+            );
 
-    removeConsumer(producer_id) {
-        // Call callback to remove remote stream instead of direct DOM manipulation
-        this.onRemoteStreamRemove(producer_id);
+            consumer.on(
+                'transportclose',
+                function() {
+                    this.consumerManager.removeConsumer(producer_id);
+                    this.mediaElementManager.removeConsumer(producer_id);
+                }.bind(this)
+            );
 
-        // Close and delete the consumer
-        const consumer = this.consumers.get(producer_id);
-        if (consumer) {
-            consumer.close();
-            this.consumers.delete(producer_id);
+            consumer.on(
+                'producerclose',
+                function() {
+                    this.consumerManager.removeConsumer(producer_id);
+                    this.mediaElementManager.removeConsumer(producer_id);
+                }.bind(this)
+            );
+
+            return { consumer, stream, kind };
+        } catch (error) {
+            console.error('Error consuming producer:', producer_id, error);
+            throw error;
         }
     }
 
     closeProducer(type) {
-        // Check if producer exists
-        if (!this.producerLabel.has(type)) {
-            console.log('No producer for type:', type);
-            return;
-        }
-
-        // Get producer ID
-        const producer_id = this.producerLabel.get(type);
-
-        // Notify server
-        this.socket.emit('producerClosed', {
-            producer_id
-        });
-
-        // Close and clean up producer
-        const producer = this.producers.get(producer_id);
-        if (producer) {
-            producer.close();
-            this.producers.delete(producer_id);
-        }
-
-        // Remove from producer label map
-        this.producerLabel.delete(type);
-    }
-
-    // createElement(kind, stream, _id, _parent = null) {
-    //     let elem;
-    //     if( kind === 'video' || kind === 'screen' ) {
-    //         elem = document.createElement('video');
-    //         elem.srcObject = stream;
-    //         elem.id = _id;
-    //         elem.playsInline = false;
-    //         elem.autoplay = true;
-    //         _parent.appendChild(elem);
-    //     } else {
-    //         elem = document.createElement('audio');
-    //         elem.srcObject = stream;
-    //         elem.id = _id;
-    //         elem.playsinline = false;
-    //         elem.autoplay = true;
-    //         document.getElementById('audioEl').appendChild(elem);
-    //     }
-    //     return elem;
-    // }
-
-    
-    
-
-
-    
-    /**
- * Creates a media element (video or audio) with Tailwind CSS styling
- * @param {string} kind - Type of media ('video', 'screen', or 'audio')
- * @param {MediaStream} stream - The media stream to attach
- * @param {string} _id - Element ID
- * @param {HTMLElement} _parent - Parent element to append to (optional)
- * @returns {HTMLElement} The created media element
- */
-createElement(kind, stream, _id, _parent = null) {
-    let elem;
-    
-    if (kind === 'video' || kind === 'screen') {
-        // Create container for video and stats
-        const container = document.createElement('div');
-        container.id = `container-${_id}`;
-        container.className = 'flex flex-col md:flex-row gap-4 mb-6';
-        
-        // Create wrapper div for video - increased size
-        const wrapper = document.createElement('div');
-        wrapper.id = `wrapper-${_id}`;
-        wrapper.className = 'relative bg-gray-800 rounded-lg overflow-hidden shadow-lg w-full md:w-[640px] h-[360px] flex items-center justify-center';
-        
-        // Create video element
-        elem = document.createElement('video');
-        elem.srcObject = stream;
-        elem.id = _id;
-        elem.playsInline = false;
-        elem.autoplay = true;
-        elem.className = 'w-full h-full object-cover';
-        
-        // Create label for video type
-        const typeLabel = document.createElement('div');
-        typeLabel.className = 'absolute top-2 right-2 px-2 py-1 text-xs font-semibold rounded-full';
-        
-        if (kind === 'video') {
-            typeLabel.className += ' bg-blue-500 text-white';
-            typeLabel.textContent = 'Camera';
-        } else {
-            typeLabel.className += ' bg-green-500 text-white';
-            typeLabel.textContent = 'Screen';
-        }
-        
-        // Create quality indicator in bottom left
-        const qualityIndicator = document.createElement('div');
-        qualityIndicator.id = `quality-${_id}`;
-        qualityIndicator.className = 'absolute bottom-2 left-2 px-2 py-1 text-xs font-semibold rounded-full bg-yellow-500 text-gray-900';
-        // qualityIndicator.textContent = 'HD'; // Default quality
-        qualityIndicator.textContent = `${elem.videoWidth} x ${elem.videoHeight}`;;
-        console.log(`${elem.videoWidth} x ${elem.videoHeight}`)
-        
-        const statsPanel = document.createElement('div');
-        statsPanel.id = `stats-${_id}`;
-        statsPanel.className = 'bg-gray-100 dark:bg-gray-800 rounded-lg p-3 shadow-md w-full md:w-64 text-xs';
-
-        
-        // Hardcoded stats content
-        const data = {
-            "current_conditions": {
-                "bandwidth": 2.5,
-                "throughput": 1.03,
-                "packet_loss": 0,
-                "latency": 0,
-                "jitter": 29,
-                "current_congestion": "23.3%",
-                "current_score": 76.68,
-            },
-            "optimal_configuration": {
-                "bandwidth": 5,
-                "predicted_score": 77.05,
-                "video_quality": "FHD",
-                "congestion_reduction": "0.4%",
-                "bandwidth_improvement": "100.0%",
-                "quality_improvement": "0.4%"
-            }
-        };
-        
-        // Format the stats panel HTML
-        statsPanel.innerHTML = `
-            <h3 class="font-bold text-sm mb-2 text-gray-700 dark:text-gray-300">Network Stats</h3>
-            <div class="space-y-1">
-                <div class="flex justify-between">
-                    <span class="text-gray-600 dark:text-gray-400">Bandwidth:</span>
-                    <span class="font-medium">${data.current_conditions.bandwidth} Mbps</span>
-                </div>
-                <div class="flex justify-between">
-                    <span class="text-gray-600 dark:text-gray-400">Throughput:</span>
-                    <span class="font-medium">${data.current_conditions.throughput}</span>
-                </div>
-                <div class="flex justify-between">
-                    <span class="text-gray-600 dark:text-gray-400">Latency:</span>
-                    <span class="font-medium">${data.current_conditions.latency} ms</span>
-                </div>
-                <div class="flex justify-between">
-                    <span class="text-gray-600 dark:text-gray-400">Jitter:</span>
-                    <span class="font-medium">${data.current_conditions.jitter} ms</span>
-                </div>
-                <div class="flex justify-between">
-                    <span class="text-gray-600 dark:text-gray-400">Congestion:</span>
-                    <span class="font-medium">${data.current_conditions.current_congestion}</span>
-                </div>
-                <div class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
-                    <h4 class="font-semibold text-xs mb-1 text-gray-700 dark:text-gray-300">Optimal Configuration</h4>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600 dark:text-gray-400">Suggested Quality:</span>
-                        <span class="font-medium" id="quality-text-${_id}">${data.optimal_configuration.video_quality}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600 dark:text-gray-400">Score:</span>
-                        <span class="font-medium">${data.current_conditions.current_score.toFixed(1)}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600 dark:text-gray-400">Bandwidth:</span>
-                        <span class="font-medium">${data.optimal_configuration.bandwidth} Mbps</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600 dark:text-gray-400">Congestion Reduction:</span>
-                        <span class="font-medium">${data.optimal_configuration.congestion_reduction}</span>
-                    </div>
-                </div>
-            </div>
-        `;
-        
-        // Assemble the video component
-        wrapper.appendChild(elem);
-        wrapper.appendChild(typeLabel);
-        wrapper.appendChild(qualityIndicator);
-        
-        // Assemble the container
-        container.appendChild(wrapper);
-        container.appendChild(statsPanel);
-        
-        // Append to parent container
-        if (_parent) {
-            _parent.appendChild(container);
-        }
-        
-        // Return the video element (not the wrapper)
-        return elem;
-    } else {
-        // Create audio element
-        elem = document.createElement('audio');
-        elem.srcObject = stream;
-        elem.id = _id;
-        elem.playsinline = false;
-        elem.autoplay = true;
-        elem.className = 'hidden'; // Hide audio elements
-        
-        // Find or create audio container
-        let audioContainer = document.getElementById('audioEl');
-        if (!audioContainer) {
-            audioContainer = document.createElement('div');
-            audioContainer.id = 'audioEl';
-            audioContainer.className = 'hidden';
-            document.body.appendChild(audioContainer);
-        }
-        
-        audioContainer.appendChild(elem);
-        return elem;
-    }
-}
-
-/**
- * Removes a consumer and cleans up associated resources
- * @param {string} consumer_id - ID of the consumer to remove
- */
-removeConsumer(producer_id) {
-    // Find the container element
-    const container = document.getElementById(`container-${producer_id}`);
-    const elem = document.getElementById(producer_id);
-    
-    console.log('Removing consumer', producer_id);
-    
-    if (elem) {
-        // Stop all tracks
-        if (elem.srcObject) {
-            elem.srcObject.getTracks().forEach(track => track.stop());
+        const producer_id = this.producerManager.closeProducer(type);
+        if (producer_id) {
+            this.mediaElementManager.closeProducer(type, producer_id);
         }
     }
-    
-    // Remove the container with animation
-    if (container) {
-        // Add fade-out and scale-down animation
-        container.classList.add('transition-all', 'duration-300', 'opacity-0', 'scale-95');
-        
-        // Remove after animation completes
-        setTimeout(() => {
-            if (container.parentNode) {
-                container.parentNode.removeChild(container);
-            }
-        }, 300);
-    } else if (elem && elem.parentNode) {
-        // Fallback if container not found
-        elem.parentNode.removeChild(elem);
-    }
-    
-    // Close and delete the consumer
-    const consumer = this.consumers.get(producer_id);
-    if (consumer) {
-        consumer.close();
-        this.consumers.delete(producer_id);
-    }
-}
 
-/**
- * Closes a producer and cleans up associated resources
- * @param {string} type - Type of producer to close ('video', 'screen', or 'audio')
- */
-closeProducer(type) {
-    // Check if producer exists
-    if (!this.producerLabel.has(type)) {
-        console.log('No producer for type:', type);
-        return;
+    removeConsumer(producer_id) {
+        this.consumerManager.removeConsumer(producer_id);
+        this.mediaElementManager.removeConsumer(producer_id);
     }
-    
-    // Get producer ID
-    const producer_id = this.producerLabel.get(type);
-    
-    // Notify server
-    this.socket.emit('producerClosed', {
-        producer_id
-    });
-    
-    // Close and clean up producer
-    const producer = this.producers.get(producer_id);
-    if (producer) {
-        producer.close();
-        this.producers.delete(producer_id);
-    }
-    
-    // Remove from producer label map
-    this.producerLabel.delete(type);
-    
-    // Clean up media element for video/screen
-    if (type !== 'audio') {
-        const container = document.getElementById(`container-${producer_id}`);
-        const elem = document.getElementById(producer_id);
-        
-        if (elem && elem.srcObject) {
-            // Stop all tracks
-            elem.srcObject.getTracks().forEach(track => track.stop());
-        }
-        
-        if (container) {
-            // Add fade-out and scale-down animation
-            container.classList.add('transition-all', 'duration-300', 'opacity-0', 'scale-95');
-            
-            // Remove after animation completes
-            setTimeout(() => {
-                if (container.parentNode) {
-                    container.parentNode.removeChild(container);
-                }
-            }, 300);
-        } else if (elem && elem.parentNode) {
-            // Fallback if container not found
-            elem.parentNode.removeChild(elem);
+
+    async reconnect() {
+        try {
+            console.log('Attempting to reconnect...');
+
+            // Clean up existing connections
+            this.exit(true);
+
+            // Reset managers
+            this.deviceManager = new DeviceManager(this.mediasoupClient);
+            this.transportManager = new TransportManager(this.deviceManager.getDevice(), this.socket);
+            this.producerManager = new ProducerManager(this.transportManager.getProducerTransport(), this.deviceManager.getDevice(), this.socket);
+            this.consumerManager = new ConsumerManager(this.transportManager.getConsumerTransport(), this.socket);
+            this.mediaElementManager = new MediaElementManager();
+            this.socketEventHandler = new SocketEventHandler(this.socket, this.consumerManager, this.mediaElementManager);
+
+            // Rejoin the room
+            await this.joinRoom();
+
+            console.log('Reconnection successful');
+        } catch (error) {
+            console.error('Reconnection failed:', error);
+            throw error;
         }
     }
-}
-
-/**
- * Updates the quality indicator for a video element
- * This function should be called when the actual video quality changes
- * @param {string} elementId - ID of the video element
- * @param {string} quality - Quality level ('4K', 'FHD', 'HD', 'SD')
- */
-updateVideoQuality(elementId, quality) {
-    const qualityIndicator = document.getElementById(`quality-${elementId}`);
-    const qualityText = document.getElementById(`quality-text-${elementId}`);
-    
-    if (!qualityIndicator) return;
-    
-    // Set color based on quality
-    let bgColor, textColor;
-    
-    switch (quality) {
-        case '4K':
-            bgColor = 'bg-green-500';
-            textColor = 'text-white';
-            break;
-        case 'FHD':
-            bgColor = 'bg-blue-500';
-            textColor = 'text-white';
-            break;
-        case 'HD':
-            bgColor = 'bg-yellow-500';
-            textColor = 'text-gray-900';
-            break;
-        case 'SD':
-            bgColor = 'bg-red-500';
-            textColor = 'text-white';
-            break;
-        default:
-            bgColor = 'bg-gray-700';
-            textColor = 'text-white';
-    }
-    
-    // Remove all background and text color classes
-    qualityIndicator.className = qualityIndicator.className
-        .replace(/bg-\w+-\d+/g, '')
-        .replace(/text-\w+-\d+/g, '')
-        .trim();
-    
-    // Add new classes
-    qualityIndicator.className = `absolute bottom-2 left-2 px-2 py-1 text-xs font-semibold rounded-full ${bgColor} ${textColor}`;
-    
-    // Update text
-    qualityIndicator.textContent = quality;
-    
-    // Update quality in stats panel if it exists
-    if (qualityText) {
-        qualityText.textContent = quality;
-    }
-    
-    // Add a brief highlight effect
-    qualityIndicator.classList.add('ring-2', 'ring-white', 'ring-opacity-70');
-    setTimeout(() => {
-        qualityIndicator.classList.remove('ring-2', 'ring-white', 'ring-opacity-70');
-    }, 1000);
-}
-
-
-
-
 }
 
 export default RoomClient;
