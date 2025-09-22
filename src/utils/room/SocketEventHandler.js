@@ -52,7 +52,7 @@ class SocketEventHandler {
         try {
             const { consumer, stream, kind } = await this.consumerManager.consume(producer_id);
             // Create element - now returns wrapper element
-            const wrapper = this.mediaElementManager.createElement(kind, stream, consumer._id, document.getElementById('remoteMedia'));
+            this.mediaElementManager.createElement(kind, stream, consumer._id, document.getElementById('remoteMedia'));
 
             // Store the mapping between producer_id and consumer_id
             this.consumerMapping.set(producer_id, consumer.id);
