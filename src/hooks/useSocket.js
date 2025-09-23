@@ -74,7 +74,7 @@ export const useSocket = (name, room_id) => {
         resetConnectionState();
 
         // Create socket with enhanced configuration
-        const socketUrl = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
+        const socketUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
         socketRef.current = io(socketUrl, {
             timeout: 10000, // 10 second timeout
             reconnection: false, // We'll handle reconnection manually
