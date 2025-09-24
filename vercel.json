@@ -8,5 +8,11 @@
         "distDir": "dist"
       }
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/room/(.*)",
+      "destination": "/index.html"
+    }
   ]
 }
